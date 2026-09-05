@@ -24,18 +24,22 @@ type Token struct {
 type OAuthClient struct {
 	httpClient *http.Client
 	limiter    Limiter
+	setupErr   error
 }
 
 // NewOAuthClient creates an OAuth client pinned to HostOpenAPI.
 func NewOAuthClient(options ...Option) *OAuthClient {
 	config := newConfig(options)
-	return &OAuthClient{httpClient: config.httpClient, limiter: config.limiter}
+	return &OAuthClient{httpClient: config.httpClient, limiter: config.limiter, setupErr: config.setupErr}
 }
 
 // Issue exchanges a client ID and secret using OAuth2 client_credentials.
 func (client *OAuthClient) Issue(ctx context.Context, clientID, clientSecret string) (Token, error) {
 	if client == nil {
 		return Token{}, errors.New("toss: OAuthClient is nil")
+	}
+	if client.setupErr != nil {
+		return Token{}, client.setupErr
 	}
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" ||
 		strings.ContainsAny(clientID+clientSecret, "\r\n") {

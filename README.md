@@ -29,8 +29,11 @@ single-flight refresh. The reference Python integration uses Redis keys
 library intentionally does not couple callers to Redis.
 
 All requests are pinned to `toss.HostOpenAPI` (`https://openapi.tossinvest.com`).
-HTTP, non-allowlisted hosts, and all redirects are rejected. This prevents a
-Bearer token or OAuth secret being sent to another authority.
+HTTP, non-lowercase HTTPS schemes, userinfo, ports, opaque URLs,
+non-allowlisted hosts, and all redirects are rejected. Standard Go transports
+are copied at construction; unsafe TLS callbacks/configuration are rejected,
+while offline fake RoundTrippers and independently-owned custom root CAs work.
+This prevents a Bearer token or OAuth secret being sent to another authority.
 
 ## Public API
 
@@ -43,6 +46,8 @@ Bearer token or OAuth secret being sent to another authority.
 | `Client.MarketCalendar` | `GET /api/v1/market-calendar/KR` or `/US` |
 | `Limiter`, `WithLimiter` | Pre-request hook; default is no-op |
 | `ParseResponse`, `ResponseError`, `RateLimitError` | Toss envelope and non-JSON response errors |
+| `ErrUnsafeTransport` | Unsafe standard transport configuration rejection |
+| `TransportError`, `ErrTransportFailure` | Fixed, non-leaking transport failure taxonomy |
 
 Endpoint results are `json.RawMessage`, preserving Toss decimal strings and
 fields without making a lossy schema commitment in v0.
@@ -66,7 +71,8 @@ integration planning only; this package enforces none by default.
 
 | API group | Reference limit |
 | --- | --- |
-| General reads/auth | 5 TPS |
-| Order endpoints (not in this library) | 3 TPS |
+| AUTH | 5 TPS |
+| MARKET_DATA (prices) | 10 TPS |
+| MARKET_INFO (calendar) | 3 TPS |
 
 Run local checks with `go vet ./...`, `go test -race ./...`, and `gitleaks dir .`.

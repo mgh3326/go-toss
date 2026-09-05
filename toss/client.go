@@ -6,10 +6,13 @@ package toss
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,7 +26,15 @@ const (
 	defaultTimeout = 10 * time.Second
 )
 
-var errRedirectBlocked = errors.New("toss: redirect blocked")
+var (
+	errRedirectBlocked = errors.New("toss: redirect blocked")
+	// ErrUnsafeTransport is returned before a request can consult a caller
+	// supplied transport that weakens TLS or authority verification.
+	ErrUnsafeTransport = errors.New("toss: caller HTTP transport weakens TLS or authority verification")
+	// ErrTransportFailure is the only sentinel unwrapped by TransportError.
+	// It deliberately does not expose the lower-level transport failure.
+	ErrTransportFailure = errors.New("toss: transport request failed")
+)
 
 // TokenProvider supplies a usable access token for an API request.
 //
@@ -47,6 +58,7 @@ func (nopLimiter) Wait(context.Context) error { return nil }
 type config struct {
 	httpClient *http.Client
 	limiter    Limiter
+	setupErr   error
 }
 
 // Option configures a Client or OAuthClient.
@@ -75,6 +87,12 @@ func newConfig(options []Option) config {
 	}
 	// Copy rather than mutate a caller-owned client, then force no redirects.
 	clientCopy := *config.httpClient
+	transport, err := safeTransport(config.httpClient)
+	if err != nil {
+		config.setupErr = err
+	} else {
+		clientCopy.Transport = transport
+	}
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errRedirectBlocked
 	}
@@ -85,21 +103,82 @@ func newConfig(options []Option) config {
 	return config
 }
 
+// safeTransport accepts fake RoundTrippers for offline tests. Standard
+// transports are owned by this client so later global/caller mutation cannot
+// change TLS roots or transport fields used by a request.
+func safeTransport(client *http.Client) (http.RoundTripper, error) {
+	var base http.RoundTripper
+	if client != nil {
+		base = client.Transport
+	}
+	if base == nil {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return &http.Transport{}, nil
+		}
+		return ownedStandardTransport(defaultTransport, true)
+	}
+	if transport, ok := base.(*http.Transport); ok {
+		return ownedStandardTransport(transport, false)
+	}
+	return base, nil
+}
+
+func ownedStandardTransport(source *http.Transport, implicit bool) (*http.Transport, error) {
+	if !implicit && unsafeStandardTransport(source) {
+		return nil, ErrUnsafeTransport
+	}
+	clone := source.Clone()
+	clone.Proxy = nil
+	if implicit {
+		clone.TLSNextProto = nil
+	}
+	if clone.TLSClientConfig != nil && clone.TLSClientConfig.RootCAs != nil {
+		// tls.Config.Clone retains CertPool identity; a separate pool prevents an
+		// in-place AddCert on the caller/global pool changing this client.
+		clone.TLSClientConfig.RootCAs = clone.TLSClientConfig.RootCAs.Clone()
+	}
+	if unsafeStandardTransport(clone) {
+		return nil, ErrUnsafeTransport
+	}
+	return clone, nil
+}
+
+// Keep this taxonomy aligned with go-kis: callbacks and protocol hooks can
+// bypass ordinary peer/hostname verification and are not safe to inherit.
+func unsafeStandardTransport(transport *http.Transport) bool {
+	if transport.DialTLS != nil || transport.DialTLSContext != nil || transport.TLSNextProto != nil {
+		return true
+	}
+	config := transport.TLSClientConfig
+	if config == nil {
+		return false
+	}
+	return config.InsecureSkipVerify || config.VerifyPeerCertificate != nil || config.VerifyConnection != nil || config.Time != nil || config.GetCertificate != nil || config.GetClientCertificate != nil || config.GetConfigForClient != nil || config.ClientSessionCache != nil || config.Renegotiation != tls.RenegotiateNever || config.KeyLogWriter != nil || config.Rand != nil || config.WrapSession != nil || config.UnwrapSession != nil || config.EncryptedClientHelloRejectionVerify != nil || config.GetEncryptedClientHelloKeys != nil || (config.MinVersion != 0 && config.MinVersion < tls.VersionTLS12) || (config.MaxVersion != 0 && config.MaxVersion < tls.VersionTLS12)
+}
+
 // Client makes read-only Toss API requests.
 type Client struct {
 	httpClient *http.Client
 	tokens     TokenProvider
 	limiter    Limiter
+	setupErr   error
 }
 
 // NewClient creates a client pinned to HostOpenAPI.
 func NewClient(tokens TokenProvider, options ...Option) *Client {
 	config := newConfig(options)
-	return &Client{httpClient: config.httpClient, tokens: tokens, limiter: config.limiter}
+	return &Client{httpClient: config.httpClient, tokens: tokens, limiter: config.limiter, setupErr: config.setupErr}
 }
 
 func (client *Client) get(ctx context.Context, path string, query url.Values) (json.RawMessage, error) {
-	if client == nil || client.tokens == nil {
+	if client == nil {
+		return nil, errors.New("toss: TokenProvider is required")
+	}
+	if client.setupErr != nil {
+		return nil, client.setupErr
+	}
+	if client.tokens == nil {
 		return nil, errors.New("toss: TokenProvider is required")
 	}
 	if err := client.limiter.Wait(ctx); err != nil {
@@ -134,20 +213,13 @@ func newRequest(ctx context.Context, method, path string, query url.Values, body
 }
 
 func assertTossURL(target *url.URL) error {
-	if target == nil || !strings.EqualFold(target.Scheme, "https") {
-		return &HostError{URL: urlString(target), Reason: "https is required"}
+	if target == nil || target.Scheme != "https" {
+		return &HostError{URL: HostOpenAPI, Reason: "https is required"}
 	}
-	if target.User != nil || !strings.EqualFold(target.Host, "openapi.tossinvest.com") {
-		return &HostError{URL: urlString(target), Reason: "host is not allowlisted"}
+	if target.Opaque != "" || target.User != nil || target.Port() != "" || !strings.EqualFold(target.Hostname(), "openapi.tossinvest.com") {
+		return &HostError{URL: HostOpenAPI, Reason: "host is not allowlisted"}
 	}
 	return nil
-}
-
-func urlString(target *url.URL) string {
-	if target == nil {
-		return ""
-	}
-	return target.String()
 }
 
 func doJSON(client *http.Client, request *http.Request) (json.RawMessage, error) {
@@ -157,13 +229,58 @@ func doJSON(client *http.Client, request *http.Request) (json.RawMessage, error)
 	response, err := client.Do(request)
 	if err != nil {
 		if errors.Is(err, errRedirectBlocked) {
-			return nil, &HostError{URL: request.URL.String(), Reason: "redirect refused"}
+			return nil, &HostError{URL: HostOpenAPI, Reason: "redirect refused"}
 		}
-		return nil, err
+		return nil, transportError(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
-		return nil, &HostError{URL: request.URL.String(), Reason: "redirect refused"}
+		return nil, &HostError{URL: HostOpenAPI, Reason: "redirect refused"}
 	}
 	return ParseResponse(response)
+}
+
+// TransportError contains only a fixed category and a controlled location.
+// It intentionally never retains a url.Error or any lower transport error.
+type TransportError struct {
+	Category string
+	Location string
+}
+
+func (error *TransportError) Error() string {
+	return fmt.Sprintf("toss: transport failure (category=%s, location=%s)", error.Category, error.Location)
+}
+
+func (error *TransportError) Unwrap() error { return ErrTransportFailure }
+
+func transportError(err error) error {
+	return &TransportError{Category: classifyTransportFailure(err), Location: HostOpenAPI}
+}
+
+func classifyTransportFailure(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		return "dns"
+	}
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var certificateInvalid x509.CertificateInvalidError
+	if errors.As(err, &unknownAuthority) || errors.As(err, &hostname) || errors.As(err, &certificateInvalid) {
+		return "tls"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	var operation *net.OpError
+	if errors.As(err, &operation) {
+		return "connection"
+	}
+	return "other"
 }
