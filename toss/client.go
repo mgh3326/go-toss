@@ -216,7 +216,9 @@ func assertTossURL(target *url.URL) error {
 	if target == nil || target.Scheme != "https" {
 		return &HostError{URL: HostOpenAPI, Reason: "https is required"}
 	}
-	if target.Opaque != "" || target.User != nil || target.Port() != "" || !strings.EqualFold(target.Hostname(), "openapi.tossinvest.com") {
+	// URL.Hostname and URL.Port normalize a trailing colon and DNS brackets
+	// away, so compare the raw authority to enforce the canonical DNS form.
+	if target.Opaque != "" || target.User != nil || target.Port() != "" || !strings.EqualFold(target.Host, "openapi.tossinvest.com") {
 		return &HostError{URL: HostOpenAPI, Reason: "host is not allowlisted"}
 	}
 	return nil

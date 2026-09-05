@@ -85,6 +85,8 @@ func TestURLGuardRejectsBypassesWithoutLeakingInput(t *testing.T) {
 		"opaque":           {Scheme: "https", Opaque: "//evil.invalid/" + fixtureSecret},
 		"userinfo":         {Scheme: "https", Host: "openapi.tossinvest.com", User: url.UserPassword("user", fixtureSecret)},
 		"port":             {Scheme: "https", Host: "openapi.tossinvest.com:443"},
+		"empty port":       {Scheme: "https", Host: "openapi.tossinvest.com:"},
+		"bracketed DNS":    {Scheme: "https", Host: "[openapi.tossinvest.com]"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := assertTossURL(target)
@@ -94,9 +96,11 @@ func TestURLGuardRejectsBypassesWithoutLeakingInput(t *testing.T) {
 			}
 		})
 	}
-	if err := assertTossURL(&url.URL{Scheme: "https", Host: "OPENAPI.TOSSINVEST.COM"}); err != nil {
-		t.Fatalf("canonical host casing rejected: %v", err)
-	}
+	t.Run("uppercase host accepted", func(t *testing.T) {
+		if err := assertTossURL(&url.URL{Scheme: "https", Host: "OPENAPI.TOSSINVEST.COM"}); err != nil {
+			t.Fatalf("canonical host casing rejected: %v", err)
+		}
+	})
 }
 
 func TestRedirectIsBlocked(t *testing.T) {
